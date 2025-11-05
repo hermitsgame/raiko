@@ -239,6 +239,8 @@ impl ChainSpec {
 // network enum here either has fixed setting or need known patch fix
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Network {
+    /// Devnet
+    Devnet,
     /// The Ethereum Mainnet
     #[default]
     Ethereum,
@@ -257,6 +259,7 @@ impl std::fmt::Display for Network {
             Network::Holesky => "holesky",
             Network::TaikoA7 => "taiko_a7",
             Network::TaikoMainnet => "taiko_mainnet",
+            Network::Devnet => "devnet",
         })
     }
 }

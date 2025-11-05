@@ -452,6 +452,12 @@ impl ProtocolInstance {
             .unwrap_or_default();
 
         let transition = match input.taiko.block_proposed {
+            BlockProposedFork::Nothing => TransitionFork::Hekla(Transition {
+                parentHash: header.parent_hash,
+                blockHash: header.hash_slow(),
+                stateRoot: header.state_root,
+                graffiti: input.taiko.prover_data.graffiti,
+            }),
             BlockProposedFork::Hekla(_) => TransitionFork::Hekla(Transition {
                 parentHash: header.parent_hash,
                 blockHash: header.hash_slow(),

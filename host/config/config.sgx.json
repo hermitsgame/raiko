@@ -6,7 +6,8 @@
         "instance_ids": {
             "HEKLA": 0,
             "ONTAKE": 0,
-            "PACAYA": 0
+            "PACAYA": 0,
+            "SHANGHAI": 0
         },
         "setup": false,
         "bootstrap": false,

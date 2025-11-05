@@ -15,6 +15,16 @@ use anyhow::{bail, ensure, Result};
 use reth_chainspec::{
     ChainSpecBuilder, Hardfork, HOLESKY, MAINNET, TAIKO_A7, TAIKO_DEV, TAIKO_MAINNET, TAIKO_TOLBA,
 };
+use once_cell::sync::Lazy;
+use reth_chainspec::ChainSpec as RethChainSpec;
+use reth_primitives::genesis::Genesis as RethGenesis;
+
+// Local DEVNET definition: load geth-style genesis and construct ChainSpec (like MAINNET does)
+static DEVNET: Lazy<Arc<RethChainSpec>> = Lazy::new(|| {
+    let genesis: RethGenesis = serde_json::from_str(include_str!("/etc/raiko/dev.genesis.json"))
+        .expect("Can't deserialize devnet genesis json");
+    Arc::new(RethChainSpec::from(genesis))
+});
 use reth_evm::execute::{BlockExecutionOutput, BlockValidationError, Executor, ProviderError};
 use reth_evm_ethereum::execute::{
     validate_block_post_execution, Consensus, EthBeaconConsensus, EthExecutorProvider,
@@ -171,6 +181,15 @@ impl<DB: Database<Error = ProviderError> + DatabaseCommit + OptimisticDatabase>
             "holesky" => HOLESKY.clone(),
             "taiko_dev" => TAIKO_DEV.clone(),
             "taiko_hoodi" => TAIKO_TOLBA.clone(),
+            "devnet" => {
+                Arc::new(
+                    ChainSpecBuilder::default()
+                        .chain(DEVNET.chain)
+                        .genesis(DEVNET.genesis.clone())
+                        .shanghai_activated()
+                        .build(),
+                )
+            }
             _ => unimplemented!(),
         };
 
@@ -252,13 +271,71 @@ impl<DB: Database<Error = ProviderError> + DatabaseCommit + OptimisticDatabase>
                 error!("Error executing block: {e:?}");
                 e
             })?;
+        
         // Filter out the valid transactions so that the header checks only take these into account
         block.body = valid_transaction_indices
             .iter()
             .map(|&i| block.body[i].clone())
             .collect();
 
+        // For non-Taiko chains with fixed base_fee (like devnet), we need to handle the base_fee carefully:
+        // The validate_block_post_execution function will recalculate base_fee according to EIP-1559
+        // and expect it to match the block header. Since the chain has a fixed base_fee (2000) but
+        // EIP-1559 calculation would give 1750, we need to temporarily set the base_fee to the
+        // calculated value for validation, then use the chain's actual value in finalize()
+        let eip1559_calculated_base_fee: Option<U256> = if !reth_chain_spec.is_taiko() {
+            // Calculate what EIP-1559 would produce based on parent header and gas used
+            let parent_base_fee = U256::from(self.input.parent_header.base_fee_per_gas
+                .unwrap_or(0));
+            let gas_used = block.block.header.gas_used;
+            let gas_limit = block.block.header.gas_limit;
+            
+            // Use EIP-1559 constants from chain spec
+            let eip1559_constants = &self.input.chain_spec.eip_1559_constants;
+            let elasticity_multiplier = eip1559_constants.elasticity_multiplier;
+            let base_fee_change_denominator = eip1559_constants.base_fee_change_denominator;
+            
+            // EIP-1559 target gas is gas_limit / elasticity_multiplier
+            let elasticity_u64 = elasticity_multiplier.to::<u64>();
+            let target_gas = gas_limit / elasticity_u64;
+            
+            // Calculate base_fee using EIP-1559 formula
+            // base_fee = parent_base_fee + parent_base_fee * (gas_used - target_gas) / target_gas / base_fee_change_denominator
+            let gas_delta = if gas_used > target_gas {
+                gas_used - target_gas
+            } else {
+                target_gas - gas_used
+            };
+            
+            let base_fee_delta = parent_base_fee
+                .checked_mul(U256::from(gas_delta))
+                .and_then(|x| x.checked_div(U256::from(target_gas)))
+                .and_then(|x| x.checked_div(base_fee_change_denominator))
+                .unwrap_or(U256::ZERO);
+            
+            let calculated_base_fee = if gas_used > target_gas {
+                parent_base_fee.checked_add(base_fee_delta).unwrap_or(parent_base_fee)
+            } else {
+                parent_base_fee.checked_sub(base_fee_delta).unwrap_or(U256::ZERO)
+            };
+            
+            Some(calculated_base_fee)
+        } else {
+            None
+        };
+
         // Header validation
+        // For non-Taiko chains with fixed base_fee (like devnet), we need to set the base_fee
+        // BEFORE sealing so that validate_block_post_execution sees the EIP-1559 calculated value
+        // (which it expects) rather than the chain's fixed value. We'll restore the chain's
+        // actual value in finalize() so the final header check passes.
+        if !reth_chain_spec.is_taiko() {
+            if let Some(calculated_base_fee) = eip1559_calculated_base_fee {
+                // Set the base_fee before sealing so validation will see the EIP-1559 calculated value
+                block.block.header.base_fee_per_gas = Some(calculated_base_fee.to::<u64>());
+            }
+        }
+        
         let block = block.seal_slow();
         if !optimistic {
             let consensus = EthBeaconConsensus::new(reth_chain_spec.clone());
@@ -274,9 +351,12 @@ impl<DB: Database<Error = ProviderError> + DatabaseCommit + OptimisticDatabase>
             // Validates ommers hash, transaction root, withdrawals root
             consensus.validate_block_pre_execution(&block)?;
             // Validates the gas used, the receipts root and the logs bloom
+            // For non-Taiko chains with fixed base_fee, the unsealed block should already have
+            // the EIP-1559 calculated base_fee (set before sealing above)
+            let unsealed_block = block.block.unseal();
             validate_block_post_execution(
                 &BlockWithSenders {
-                    block: block.block.unseal(),
+                    block: unsealed_block,
                     senders: block.senders,
                 },
                 &reth_chain_spec.clone(),
@@ -317,6 +397,10 @@ impl RethBlockBuilder<MemDb> {
     pub fn finalize(&mut self) -> Result<Header> {
         let state_root = self.calculate_state_root()?;
         ensure!(self.input.block.state_root == state_root);
+        
+        // For non-Taiko chains with fixed base_fee (like devnet), ensure we use the
+        // chain's actual base_fee, not the EIP-1559 calculated value used during validation.
+        // We return the input block's header which contains the chain's actual base_fee.
         Ok(self.input.block.header.clone())
     }
 

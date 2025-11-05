@@ -112,6 +112,10 @@ function update_docker_chain_specs() {
     if [ -n "${TOLBA_RPC}" ]; then
         update_chain_spec_json $CONFIG_FILE "taiko_hoodi" "rpc" $TOLBA_RPC
     fi
+
+    if [ -n "${DEVNET_RPC}" ]; then
+        update_chain_spec_json $CONFIG_FILE "devnet" "rpc" $DEVNET_RPC
+    fi
 }
 
 function update_config_json() {
@@ -278,9 +282,9 @@ if [[ -n $SGX_SERVER ]]; then
         fi
 
         echo "start sgx-guest --sgx-instance-id $SGX_PACAYA_INSTANCE_ID --address 0.0.0.0 --port 9090"
-        gramine-sgx /opt/raiko/bin/sgx-guest serve --sgx-instance-id $SGX_PACAYA_INSTANCE_ID --address 0.0.0.0 --port 9090 | sed 's/^/[raiko] /' &
-        echo "start gaiko serve --sgx-instance-id $SGXGETH_PACAYA_INSTANCE_ID --port 8080"
-        /opt/raiko/bin/gaiko --verbosity $GAIKO_GUEST_APP_VERBOSE_LEVEL serve --sgx-instance-id $SGXGETH_PACAYA_INSTANCE_ID --port 8090 | sed 's/^/[gaiko] /' &
+        gramine-sgx /opt/raiko/bin/sgx-guest serve --sgx-instance-id $SGX_PACAYA_INSTANCE_ID --address 0.0.0.0 --port 9090 &
+        #echo "start gaiko serve --sgx-instance-id $SGXGETH_PACAYA_INSTANCE_ID --port 8080"
+        #/opt/raiko/bin/gaiko --verbosity $GAIKO_GUEST_APP_VERBOSE_LEVEL serve --sgx-instance-id $SGXGETH_PACAYA_INSTANCE_ID --port 8090 | sed 's/^/[gaiko] /' &
         wait
     fi
 fi

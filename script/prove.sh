@@ -19,6 +19,8 @@ get_l1_network() {
 
     if [ "$chain" == "ethereum" ]; then
         l1_network="ethereum"
+    elif [ "$chain" == "devnet" ]; then
+        l1_network="devnet"
     elif [ "$chain" == "holesky" ]; then
         l1_network="holesky" 
     elif [ "$chain" == "taiko_mainnet" ]; then

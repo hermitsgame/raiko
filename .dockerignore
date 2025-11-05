@@ -28,6 +28,7 @@
 !/ballot
 !/redis-derive
 !/gaiko
+!/dev.genesis.json
 
 /provers/sp1/guest/target
 /provers/risc0/guest/target
