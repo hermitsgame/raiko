@@ -21,7 +21,7 @@ use reth_primitives::genesis::Genesis as RethGenesis;
 
 // Local DEVNET definition: load geth-style genesis and construct ChainSpec (like MAINNET does)
 static DEVNET: Lazy<Arc<RethChainSpec>> = Lazy::new(|| {
-    let genesis: RethGenesis = serde_json::from_str(include_str!("/etc/raiko/dev.genesis.json"))
+    let genesis: RethGenesis = serde_json::from_str(include_str!("../../dev.genesis.json"))
         .expect("Can't deserialize devnet genesis json");
     Arc::new(RethChainSpec::from(genesis))
 });
