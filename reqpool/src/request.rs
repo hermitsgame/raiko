@@ -574,6 +574,9 @@ pub struct BatchGuestInputRequestEntity {
     graffiti: B256,
     /// Blob proof type.
     blob_proof_type: BlobProofType,
+    #[serde(flatten)]
+    /// Additional prover params.
+    prover_args: HashMap<String, serde_json::Value>,
 }
 
 impl BatchGuestInputRequestEntity {
@@ -584,6 +587,7 @@ impl BatchGuestInputRequestEntity {
         l1_network: String,
         graffiti: B256,
         blob_proof_type: BlobProofType,
+        prover_args: HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
             batch_id,
@@ -592,6 +596,7 @@ impl BatchGuestInputRequestEntity {
             l1_network,
             graffiti,
             blob_proof_type,
+            prover_args,
         }
     }
 }
@@ -632,6 +637,7 @@ impl BatchProofRequestEntity {
                 l1_network,
                 graffiti,
                 blob_proof_type,
+                prover_args.clone(),
             ),
             prover,
             proof_type,

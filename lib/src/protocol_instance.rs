@@ -557,6 +557,15 @@ impl ProtocolInstance {
                 blockHash: last_block.header.hash_slow(),
                 stateRoot: last_block.header.state_root,
             }),
+            BlockProposedFork::Nothing => {
+                // For non-Taiko chains or generic continuous blocks, use a generic transition
+                // We use Pacaya transition structure as it's the most general form
+                TransitionFork::Pacaya(PacayaTransition {
+                    parentHash: first_block.header.parent_hash,
+                    blockHash: last_block.header.hash_slow(),
+                    stateRoot: last_block.header.state_root,
+                })
+            }
             _ => return Err(anyhow::Error::msg("unknown transition fork")),
         };
 

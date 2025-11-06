@@ -389,6 +389,43 @@ pub async fn prepare_taiko_chain_batch_input(
     }
 }
 
+/// Prepare a generic batch input for non-Taiko chains (continuous blocks)
+pub async fn prepare_generic_chain_batch_input(
+    chain_spec: &ChainSpec,
+    batch_blocks: &[RethBlock],
+    prover_data: TaikoProverData,
+    blob_proof_type: &BlobProofType,
+) -> RaikoResult<TaikoGuestBatchInput> {
+    // For non-Taiko chains, we create a simple batch input
+    // Extract transactions from each block and encode them as RLP
+    use alloy_rlp::Encodable;
+    let mut all_txs = Vec::new();
+    for block in batch_blocks {
+        for tx in &block.body {
+            all_txs.push(tx.clone());
+        }
+    }
+    
+    // Encode all transactions as RLP list
+    let mut tx_data_from_calldata = Vec::new();
+    all_txs.encode(&mut tx_data_from_calldata);
+
+    // Create a generic batch input structure
+    // Note: batch_id is set to 0 for generic batches, batch_proposed is Nothing
+    Ok(TaikoGuestBatchInput {
+        batch_id: 0,
+        batch_proposed: BlockProposedFork::Nothing,
+        l1_header: reth_primitives::Header::default(),
+        chain_spec: chain_spec.clone(),
+        prover_data,
+        tx_data_from_calldata,
+        tx_data_from_blob: Vec::new(),
+        blob_commitments: None,
+        blob_proofs: None,
+        blob_proof_type: blob_proof_type.clone(),
+    })
+}
+
 pub async fn get_tx_blob(
     blob_hash: B256,
     timestamp: u64,

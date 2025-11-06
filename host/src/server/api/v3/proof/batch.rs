@@ -22,6 +22,7 @@ use raiko_reqpool::{
 };
 use raiko_tasks::TaskStatus;
 use serde_json::Value;
+use std::collections::HashMap;
 use utoipa::OpenApi;
 
 #[utoipa::path(post, path = "/batch",
@@ -50,51 +51,59 @@ async fn batch_handler(
         authenticated_key.name
     );
 
-    let batch_request = {
-        // Override the existing proof request config from the config file and command line
-        // options with the request from the client, and convert to a BatchProofRequest.
-        let mut opts = serde_json::to_value(actor.default_request_config())?;
-        merge(&mut opts, &batch_request_opt);
+    // Override the existing proof request config from the config file and command line
+    // options with the request from the client, and convert to a BatchProofRequest.
+    let mut opts = serde_json::to_value(actor.default_request_config())?;
+    merge(&mut opts, &batch_request_opt);
 
-        let first_batch_id = {
-            let batches = opts["batches"]
-                .as_array()
-                .ok_or(RaikoError::InvalidRequestConfig(
-                    "Missing batches".to_string(),
-                ))?;
-            let first_batch = batches.first().ok_or(RaikoError::InvalidRequestConfig(
-                "batches is empty".to_string(),
+    // Extract prover_args from the original JSON before parsing to BatchProofRequest
+    // This preserves custom fields like start_block, end_block, block_numbers that
+    // are not part of ProverSpecificOpts structure
+    let raw_prover_args: HashMap<String, serde_json::Value> = if let Some(prover_args_obj) = opts.get("prover_args").and_then(|v| v.as_object()) {
+        prover_args_obj
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let first_batch_id = {
+        let batches = opts["batches"]
+            .as_array()
+            .ok_or(RaikoError::InvalidRequestConfig(
+                "Missing batches".to_string(),
             ))?;
-            let first_batch_id = first_batch["batch_id"].as_u64().expect("checked above");
-            first_batch_id
-        };
+        let first_batch = batches.first().ok_or(RaikoError::InvalidRequestConfig(
+            "batches is empty".to_string(),
+        ))?;
+        let first_batch_id = first_batch["batch_id"].as_u64().expect("checked above");
+        first_batch_id
+    };
 
-        // For zk_any request, draw zk proof type based on the block hash.
-        if is_zk_any_request(&opts) {
-            match draw_for_zk_any_batch_request(&actor, &opts).await? {
-                Some(proof_type) => opts["proof_type"] = serde_json::to_value(proof_type).unwrap(),
-                None => {
-                    return Ok(Status::Ok {
-                        proof_type: ProofType::Native,
-                        batch_id: Some(first_batch_id),
-                        data: ProofResponse::Status {
-                            status: TaskStatus::ZKAnyNotDrawn,
-                        },
-                    });
-                }
+    // For zk_any request, draw zk proof type based on the block hash.
+    if is_zk_any_request(&opts) {
+        match draw_for_zk_any_batch_request(&actor, &opts).await? {
+            Some(proof_type) => opts["proof_type"] = serde_json::to_value(proof_type).unwrap(),
+            None => {
+                return Ok(Status::Ok {
+                    proof_type: ProofType::Native,
+                    batch_id: Some(first_batch_id),
+                    data: ProofResponse::Status {
+                        status: TaskStatus::ZKAnyNotDrawn,
+                    },
+                });
             }
         }
+    }
 
-        let batch_request_opt: BatchProofRequestOpt = serde_json::from_value(opts)?;
-        let batch_request: BatchProofRequest = batch_request_opt.try_into()?;
+    let batch_request_opt: BatchProofRequestOpt = serde_json::from_value(opts)?;
+    let batch_request: BatchProofRequest = batch_request_opt.try_into()?;
 
-        // Validate the batch request
-        if batch_request.batches.is_empty() {
-            return Err(anyhow::anyhow!("batches is empty").into());
-        }
-
-        batch_request
-    };
+    // Validate the batch request
+    if batch_request.batches.is_empty() {
+        return Err(anyhow::anyhow!("batches is empty").into());
+    }
     record_batch_request_in(&authenticated_key.name, &batch_request);
     tracing::info!(
         "Accepted {}'s batch request: {}",
@@ -134,6 +143,10 @@ async fn batch_handler(
             image_id.clone(),
         );
 
+        // Merge raw_prover_args with batch_request.prover_args to preserve all fields
+        let mut merged_prover_args: HashMap<String, serde_json::Value> = batch_request.prover_args.clone().into();
+        merged_prover_args.extend(raw_prover_args.clone());
+
         let input_request_entity = BatchGuestInputRequestEntity::new(
             *batch_id,
             *l1_inclusion_block_number,
@@ -141,12 +154,13 @@ async fn batch_handler(
             batch_request.l1_network.clone(),
             batch_request.graffiti.clone(),
             batch_request.blob_proof_type.clone(),
+            merged_prover_args.clone(),
         );
         let request_entity = BatchProofRequestEntity::new_with_guest_input_entity(
             input_request_entity.clone(),
             batch_request.prover.clone(),
             batch_request.proof_type,
-            batch_request.prover_args.clone().into(),
+            merged_prover_args,
         );
 
         sub_input_request_keys.push(input_request_key.into());

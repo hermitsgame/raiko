@@ -342,15 +342,44 @@ async fn new_raiko_for_batch_request(
     let l1_include_block_number = request_entity
         .guest_input_entity()
         .l1_inclusion_block_number();
-    // parse the batch proposal tx to get all prove blocks
-    let all_prove_blocks = parse_l1_batch_proposal_tx_for_pacaya_fork(
-        &l1_chain_spec,
-        &taiko_chain_spec,
-        *l1_include_block_number,
-        *batch_id,
-    )
-    .await
-    .map_err(|err| format!("Could not parse L1 batch proposal tx: {err:?}"))?;
+    
+    // Check if this is a continuous block request (batch_id=0 and l1_inclusion_block_number=0)
+    let all_prove_blocks = if *batch_id == 0 && *l1_include_block_number == 0 {
+        // For continuous blocks, get block numbers from prover_args
+        let block_numbers = if let Some(block_numbers_value) = request_entity.prover_args().get("block_numbers") {
+            serde_json::from_value::<Vec<u64>>(block_numbers_value.clone())
+                .map_err(|err| format!("Failed to parse block_numbers from prover_args: {err:?}"))?
+        } else if let Some(start_block) = request_entity.prover_args().get("start_block")
+            .and_then(|v| v.as_u64())
+            .and_then(|start| {
+                request_entity.prover_args().get("end_block")
+                    .and_then(|v| v.as_u64())
+                    .map(|end| (start..=end).collect::<Vec<u64>>())
+            }) {
+            start_block
+        } else {
+            return Err("For continuous blocks (batch_id=0), either 'block_numbers' or 'start_block'/'end_block' must be provided in prover_args".to_string());
+        };
+        
+        if block_numbers.is_empty() {
+            return Err("block_numbers cannot be empty".to_string());
+        }
+        if block_numbers.len() > 1000 {
+            return Err(format!("block range too large, maximum 1000 blocks supported, got {}", block_numbers.len()));
+        }
+        
+        block_numbers
+    } else {
+        // For Taiko batch, parse the batch proposal tx to get all prove blocks
+        parse_l1_batch_proposal_tx_for_pacaya_fork(
+            &l1_chain_spec,
+            &taiko_chain_spec,
+            *l1_include_block_number,
+            *batch_id,
+        )
+        .await
+        .map_err(|err| format!("Could not parse L1 batch proposal tx: {err:?}"))?
+    };
 
     let proof_request = ProofRequest {
         block_number: 0,
@@ -375,18 +404,36 @@ async fn new_raiko_for_batch_request(
 }
 
 async fn generate_input_for_batch(raiko: &Raiko) -> Result<GuestBatchInput, String> {
-    let provider_target_blocks = (raiko.request.l2_block_numbers[0] - 1
-        ..=*raiko.request.l2_block_numbers.last().unwrap())
-        .collect();
-    let provider =
-        RpcBlockDataProvider::new_batch(&raiko.taiko_chain_spec.rpc, provider_target_blocks)
+    // Check if this is a continuous block request (batch_id=0)
+    if raiko.request.batch_id == 0 && raiko.request.l1_inclusion_block_number == 0 {
+        // For continuous blocks, use generate_continuous_batch_input
+        let start_block = raiko.request.l2_block_numbers.first()
+            .ok_or_else(|| "l2_block_numbers is empty".to_string())?;
+        let end_block = raiko.request.l2_block_numbers.last()
+            .ok_or_else(|| "l2_block_numbers is empty".to_string())?;
+        
+        let provider_target_blocks = (start_block.saturating_sub(1)..=*end_block).collect();
+        let provider =
+            RpcBlockDataProvider::new_batch(&raiko.taiko_chain_spec.rpc, provider_target_blocks)
+                .await
+                .map_err(|err| format!("failed to create rpc block data provider: {err:?}"))?;
+        
+        raiko.generate_continuous_batch_input(provider, *start_block, *end_block)
             .await
-            .expect("Could not create RpcBlockDataProvider");
-    let input = raiko
-        .generate_batch_input(provider)
-        .await
-        .map_err(|e| format!("failed to generate batch input: {e:?}"))?;
-    Ok(input)
+            .map_err(|err| format!("failed to generate continuous batch input: {err:?}"))
+    } else {
+        // For Taiko batch, use the original logic
+        let provider_target_blocks = (raiko.request.l2_block_numbers[0] - 1
+            ..=*raiko.request.l2_block_numbers.last().unwrap())
+            .collect();
+        let provider =
+            RpcBlockDataProvider::new_batch(&raiko.taiko_chain_spec.rpc, provider_target_blocks)
+                .await
+                .map_err(|err| format!("failed to create rpc block data provider: {err:?}"))?;
+        raiko.generate_batch_input(provider)
+            .await
+            .map_err(|err| format!("failed to generate batch input: {err:?}"))
+    }
 }
 
 pub async fn do_generate_batch_guest_input(
@@ -400,7 +447,7 @@ pub async fn do_generate_batch_guest_input(
         request_entity.clone(),
         Default::default(),
         Default::default(),
-        Default::default(),
+        request_entity.prover_args().clone(),
     );
     let raiko = new_raiko_for_batch_request(chain_specs, batch_proof_request_entity)
         .await

@@ -9,7 +9,7 @@ use futures::future::join_all;
 use raiko_lib::{
     builder::RethBlockBuilder,
     consts::ChainSpec,
-    input::{BlobProofType, GuestBatchInput, GuestInput, TaikoGuestInput, TaikoProverData},
+    input::{BlobProofType, BlockProposedFork, GuestBatchInput, GuestInput, TaikoGuestInput, TaikoProverData},
     primitives::mpt::proofs_to_tries,
     utils::{generate_transactions, generate_transactions_for_batch_blocks},
     Measurement,
@@ -19,7 +19,7 @@ use tracing::{debug, info};
 
 use util::{
     execute_txs, get_batch_blocks_and_parent_data, get_block_and_parent_data,
-    prepare_taiko_chain_batch_input, prepare_taiko_chain_input,
+    prepare_generic_chain_batch_input, prepare_taiko_chain_batch_input, prepare_taiko_chain_input,
 };
 
 pub use util::parse_l1_batch_proposal_tx_for_pacaya_fork;
@@ -249,17 +249,33 @@ pub async fn batch_preflight<BDP: BlockDataProvider>(
         )
         .await?
     } else {
-        return Err(RaikoError::Preflight(
-            "Batch preflight is only used for Taiko chains".to_owned(),
-        ));
+        // For non-Taiko chains, create a generic batch input
+        prepare_generic_chain_batch_input(
+            &taiko_chain_spec,
+            &all_prove_blocks,
+            prover_data,
+            &blob_proof_type,
+        )
+        .await?
     };
     measurement.stop();
 
     debug!("proven (block, parent) pairs: {:?}", block_parent_pairs);
 
     // distribute txs to each block
-    let pool_txs_list: Vec<Vec<TransactionSigned>> =
+    let mut pool_txs_list: Vec<Vec<TransactionSigned>> =
         generate_transactions_for_batch_blocks(&taiko_guest_batch_input);
+    
+    // For generic continuous blocks (non-Taiko), extract transactions from each block directly
+    if matches!(taiko_guest_batch_input.batch_proposed, BlockProposedFork::Nothing) {
+        pool_txs_list = block_parent_pairs
+            .iter()
+            .map(|(block, _)| {
+                // For non-Taiko chains, use all transactions from the block
+                block.body.clone()
+            })
+            .collect();
+    }
 
     assert_eq!(block_parent_pairs.len(), pool_txs_list.len());
 
@@ -297,11 +313,16 @@ pub async fn batch_preflight<BDP: BlockDataProvider>(
                 #[cfg(not(feature = "statedb_lru"))]
                 let initial_db = None;
 
-                let anchor_tx = prove_block.body.first().unwrap().clone();
+                // For Taiko chains, the first tx is an anchor tx; for non-Taiko chains, there's no anchor tx
+                let anchor_tx = if taiko_chain_spec.is_taiko() {
+                    Some(prove_block.body.first().unwrap().clone())
+                } else {
+                    None
+                };
                 let taiko_input = TaikoGuestInput {
                     l1_header: taiko_guest_batch_input.l1_header.clone(),
                     tx_data: Vec::new(),
-                    anchor_tx: Some(anchor_tx.clone()),
+                    anchor_tx: anchor_tx.clone(),
                     block_proposed: taiko_guest_batch_input.batch_proposed.clone(),
                     prover_data: taiko_guest_batch_input.prover_data.clone(),
                     blob_commitment: None,
@@ -337,8 +358,10 @@ pub async fn batch_preflight<BDP: BlockDataProvider>(
                 let mut builder = RethBlockBuilder::new(&input, provider_db);
 
                 // Optimize data gathering by executing the transactions multiple times so data can be requested in batches
-                let mut pool_txs = vec![anchor_tx.clone()];
-                pool_txs.extend_from_slice(&pure_pool_txs);
+                let mut pool_txs = pure_pool_txs.clone();
+                if let Some(ref anchor) = anchor_tx {
+                    pool_txs.insert(0, anchor.clone());
+                }
                 execute_txs(&mut builder, pool_txs).await?;
 
                 let db = if let Some(db) = builder.db.as_mut() {
