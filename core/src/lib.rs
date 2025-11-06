@@ -226,7 +226,12 @@ impl Raiko {
         let db = create_mem_db(&mut input.clone()).unwrap();
         let mut builder = RethBlockBuilder::new(input, db);
 
-        let mut pool_txs = vec![input.taiko.anchor_tx.clone().unwrap()];
+        // For Taiko chains, anchor_tx is required; for non-Taiko chains, it's None
+        let mut pool_txs = if let Some(ref anchor_tx) = input.taiko.anchor_tx {
+            vec![anchor_tx.clone()]
+        } else {
+            Vec::new()
+        };
         pool_txs.extend_from_slice(&origin_pool_txs);
 
         builder
