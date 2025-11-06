@@ -1,0 +1,21 @@
+[package]
+name = "raiko-verifier"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sgx-verifier"
+path = "src/main.rs"
+
+[dependencies]
+raiko-lib = { workspace = true }
+raiko-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+secp256k1 = { workspace = true }
+reth-primitives = { workspace = true }
+tokio = { workspace = true }
+
