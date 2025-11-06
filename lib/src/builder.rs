@@ -74,7 +74,12 @@ pub fn calculate_batch_blocks_final_header(input: &GuestBatchInput) -> Vec<Block
             create_mem_db(&mut input.inputs[i].clone()).unwrap(),
         );
 
-        let mut execute_tx = vec![input.inputs[i].taiko.anchor_tx.clone().unwrap()];
+        // For Taiko chains, anchor_tx is required; for non-Taiko chains, it's None
+        let mut execute_tx = if let Some(ref anchor_tx) = input.inputs[i].taiko.anchor_tx {
+            vec![anchor_tx.clone()]
+        } else {
+            Vec::new()
+        };
         execute_tx.extend_from_slice(&pool_txs);
         builder
             .execute_transactions(execute_tx.clone(), false)
