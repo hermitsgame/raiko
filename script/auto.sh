@@ -81,6 +81,12 @@ fi
 
 sleep 5
 
+# 清空旧的 secrets 和 bootstrap 文件，避免重复部署时的冲突
+echo "清理旧的 Bootstrap 数据..."
+rm -rf ~/.config/raiko/secrets/*
+rm -f ~/.config/raiko/config/bootstrap.json
+echo "✅ 清理完成"
+
 # 通过 API Bootstrap（或使用 init 容器）
 # 方式 1: API Bootstrap
 echo "执行 Bootstrap..."
