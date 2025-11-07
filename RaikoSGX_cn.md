@@ -7,6 +7,7 @@
 1. [SGX 的工作原理和在本项目中的应用](#1-sgx的工作原理和在本项目中的应用)
 2. [Raiko 项目的架构分析和数据流程](#2-raiko项目的架构分析和数据流程)
 3. [如何通过 Docker 搭建 Raiko 服务](#3-如何通过-docker-搭建-raiko-服务)
+4. [二次开发细节](#4-二次开发细节)
 
 ---
 
@@ -1667,9 +1668,10 @@ docker compose up init
 set -e
 
 # 配置变量
-RAIKO_DIR="/nvme/dev/prove/raiko"
-DEVNET_RPC="http://127.0.0.1:8545"
+RAIKO_DIR="/root/raiko"
+DEVNET_RPC="http://52.48.173.231:18545"
 INTEL_API_KEY="YOUR_API_KEY"
+DOCKER_COMPOSE_FILE="docker-compose.devnet.yml"
 
 echo "=== 步骤 1: 检查 SGX 硬件 ==="
 if ! grep -q sgx /proc/cpuinfo; then
@@ -1709,13 +1711,13 @@ cd ${RAIKO_DIR}/docker
 
 # 创建 .env 文件
 cat > .env << EOF
-SGX=true
-SGXGETH=false
 SGX_MODE=remote
 SGX_DIRECT=0
-NETWORK=taiko_dev
-L1_NETWORK=taiko_dev_l1
-TAIKO_A7_RPC=${DEVNET_RPC}
+NETWORK=devnet
+L1_NETWORK=devnet
+DEVNET_RPC=${DEVNET_RPC}
+SGX_PACAYA_INSTANCE_ID=1
+SGXGETH_PACAYA_INSTANCE_ID=2
 RAIKO_REMOTE_URL=http://raiko-sgx-server:9090
 GAIKO_REMOTE_URL=http://raiko-sgx-server:8090
 REDIS_URL=redis://redis:6379
@@ -1727,21 +1729,29 @@ EOF
 cp ../host/config/config.sgx.json ~/.config/raiko/config/
 
 echo "=== 步骤 4: 启动 PCCS 服务 ==="
-docker compose up -d pccs
+docker compose -f ${DOCKER_COMPOSE_FILE} up -d pccs
 sleep 5
 
 echo "=== 步骤 5: 启动 SGX Server 并 Bootstrap ==="
-docker compose up raiko-sgx-server -d
+docker compose -f ${DOCKER_COMPOSE_FILE} up raiko-sgx-server -d
 sleep 10
 
 # 验证 SGX Server 是否正常启动
-if docker compose ps raiko-sgx-server | grep -q "Up"; then
+if docker compose -f ${DOCKER_COMPOSE_FILE} ps raiko-sgx-server | grep -q "Up"; then
     echo "✅ SGX Server 启动成功"
 else
     echo "❌ SGX Server 启动失败，查看日志："
-    docker compose logs raiko-sgx-server
+    docker compose -f ${DOCKER_COMPOSE_FILE} logs raiko-sgx-server
     exit 1
 fi
+
+sleep 5
+
+# 清空旧的 secrets 和 bootstrap 文件，避免重复部署时的冲突
+echo "清理旧的 Bootstrap 数据..."
+rm -rf ~/.config/raiko/secrets/*
+rm -f ~/.config/raiko/config/bootstrap.json
+echo "✅ 清理完成"
 
 # 通过 API Bootstrap（或使用 init 容器）
 # 方式 1: API Bootstrap
@@ -1752,7 +1762,7 @@ else
     echo "⚠️  API Bootstrap 失败，尝试使用 init 容器"
     # 临时切换为 local 模式进行 Bootstrap
     sed -i 's/SGX_MODE=remote/SGX_MODE=local/' .env
-    docker compose up init
+    docker compose -f ${DOCKER_COMPOSE_FILE} up init
     sed -i 's/SGX_MODE=local/SGX_MODE=remote/' .env
 fi
 
@@ -1764,7 +1774,7 @@ if [ ! -f ~/.config/raiko/config/bootstrap.json ]; then
 fi
 
 echo "=== 步骤 7: 启动 Raiko Host 服务 ==="
-docker compose --profile prod-redis up raiko -d
+docker compose -f ${DOCKER_COMPOSE_FILE} --profile prod-redis up raiko -d
 
 echo "=== 步骤 8: 验证服务 ==="
 sleep 10
@@ -1783,7 +1793,7 @@ if curl -s http://localhost:8080/health > /dev/null; then
     echo "SGX Server 运行在 http://localhost:9090"
 else
     echo "❌ Raiko Host 服务启动失败，查看日志："
-    docker compose logs raiko
+    docker compose -f ${DOCKER_COMPOSE_FILE} logs raiko
     exit 1
 fi
 ```
@@ -1805,4 +1815,313 @@ fi
 - 两个服务通过 HTTP API 通信，实现服务分离和资源隔离
 
 现在可以通过 HTTP API 向 Raiko Host 发送证明请求，请求会被转发到 SGX Server 进行实际的证明生成。
+
+---
+
+## 4. 二次开发细节
+
+本章节详细介绍 devnet 分支相对于 main 分支的修改，以及如何进行二次开发。
+
+### 4.1 devnet 分支概述
+
+devnet 分支是基于 main 分支的定制化开发，主要目标是支持通用区块链网络的批量证明功能，而不仅仅局限于 Taiko 协议。该分支添加了以下核心功能：
+
+1. **通用批量证明支持**：支持任意区块链网络的连续区块批量证明
+2. **Devnet 网络支持**：添加了自定义 devnet 网络的完整支持
+3. **批量证明验证工具**：提供了完整的批量证明生成和验证脚本
+4. **协议实例扩展**：扩展了 `ProtocolInstance` 以支持非 Taiko 链的批量证明
+
+### 4.2 核心代码修改
+
+#### 4.2.1 协议实例扩展 (`lib/src/protocol_instance.rs`)
+
+**主要修改**：
+
+1. **支持 `BlockProposedFork::Nothing`**：
+   - 为非 Taiko 链或通用连续区块创建 `BatchMetadata`
+   - 从实际区块数据计算元数据，而不是依赖 Taiko 协议事件
+   - 支持计算交易哈希、时间偏移、区块参数等
+
+```rust
+BlockProposedFork::Nothing => {
+    // For non-Taiko chains or generic continuous blocks, create BatchMetadata from actual block data
+    let txs_hash = Self::calculate_pacaya_txs_hash(
+        keccak(batch_input.taiko.tx_data_from_calldata.as_slice()).into(),
+        &vec![], // No blob hashes for generic continuous blocks
+    );
+    // ... 从实际区块数据构建 BatchMetadata
+}
+```
+
+2. **通用 Transition 支持**：
+   - 为 `BlockProposedFork::Nothing` 添加了 `TransitionFork::Hekla` 和 `TransitionFork::Pacaya` 支持
+   - 允许非 Taiko 链使用通用的状态转换结构
+
+**关键特性**：
+- 自动从区块时间戳计算 `timeShift`
+- 支持排除 anchor 交易的交易计数
+- 使用默认的 base fee 配置
+
+#### 4.2.2 区块构建器扩展 (`lib/src/builder.rs`)
+
+**主要修改**：
+
+1. **Devnet 链规格支持**：
+   - 添加了 `DEVNET` 链规格定义，从 `dev.genesis.json` 加载
+   - 支持自定义 genesis 配置
+
+```rust
+static DEVNET: Lazy<Arc<RethChainSpec>> = Lazy::new(|| {
+    let genesis: RethGenesis = serde_json::from_str(include_str!("../../dev.genesis.json"))
+        .expect("Can't deserialize devnet genesis json");
+    Arc::new(RethChainSpec::from(genesis))
+});
+```
+
+2. **Anchor 交易可选支持**：
+   - 对于非 Taiko 链，`anchor_tx` 是可选的
+   - 修改了交易执行逻辑以支持无 anchor 交易的情况
+
+```rust
+// For Taiko chains, anchor_tx is required; for non-Taiko chains, it's None
+let mut execute_tx = if let Some(ref anchor_tx) = input.inputs[i].taiko.anchor_tx {
+    vec![anchor_tx.clone()]
+} else {
+    Vec::new()
+};
+```
+
+3. **Base Fee 处理优化**：
+   - 对于固定 base fee 的网络（如 devnet），优化了 EIP-1559 base fee 计算
+   - 处理了链固定 base fee 与 EIP-1559 计算值之间的差异
+
+#### 4.2.3 核心库扩展 (`core/src/lib.rs`)
+
+**新增方法**：
+
+1. **`generate_continuous_batch_input`**：
+   - 为连续区块生成批量输入
+   - 支持任意链，不仅仅是 Taiko
+   - 限制最大区块范围为 1000 个区块
+
+```rust
+pub async fn generate_continuous_batch_input<BDP: BlockDataProvider>(
+    &self,
+    provider: BDP,
+    start_block: u64,
+    end_block: u64,
+) -> RaikoResult<GuestBatchInput>
+```
+
+2. **`prove_continuous_blocks`**：
+   - 为连续区块生成单个批量证明
+   - 封装了输入生成、输出计算和证明生成的完整流程
+
+```rust
+pub async fn prove_continuous_blocks<BDP: BlockDataProvider>(
+    &self,
+    provider: BDP,
+    start_block: u64,
+    end_block: u64,
+) -> RaikoResult<Proof>
+```
+
+#### 4.2.4 API 扩展 (`host/src/server/api/v3/proof/batch.rs`)
+
+**主要修改**：
+
+1. **保留自定义字段**：
+   - 在解析 `BatchProofRequest` 之前，提取并保留 `prover_args` 中的自定义字段
+   - 支持 `start_block`、`end_block`、`block_numbers` 等非标准字段
+
+```rust
+// Extract prover_args from the original JSON before parsing to BatchProofRequest
+// This preserves custom fields like start_block, end_block, block_numbers that
+// are not part of ProverSpecificOpts structure
+let raw_prover_args: HashMap<String, serde_json::Value> = ...
+```
+
+2. **改进的错误处理**：
+   - 更好的批量请求验证
+   - 更清晰的错误消息
+
+### 4.3 新增工具和脚本
+
+#### 4.3.1 批量证明脚本 (`script/prove-and-verify-batch.sh`)
+
+**功能**：
+- 支持为连续区块范围生成批量证明
+- 自动验证证明的有效性
+- 支持多种网络（devnet、taiko_a7、taiko_mainnet 等）
+
+**使用方法**：
+```bash
+./script/prove-and-verify-batch.sh <chain> <start_block> <end_block> [rpc_url]
+```
+
+**示例**：
+```bash
+# 为 devnet 的区块 100 到 200 生成批量证明
+./script/prove-and-verify-batch.sh devnet 100 200 http://52.48.173.231:18545
+```
+
+#### 4.3.2 自动部署脚本 (`script/auto.sh`)
+
+**主要特性**：
+- 完整的自动化部署流程
+- 支持重复部署（清理旧的 secrets）
+- 支持 devnet 网络配置
+- 使用 `docker-compose.devnet.yml` 配置文件
+
+**关键改进**：
+- **清理旧数据**：在执行 Bootstrap 前清理 `~/.config/raiko/secrets/` 目录
+- **使用 devnet compose 文件**：通过 `DOCKER_COMPOSE_FILE` 变量指定
+- **Devnet 特定配置**：包括 `DEVNET_RPC`、`SGX_PACAYA_INSTANCE_ID` 等
+
+### 4.4 配置文件修改
+
+#### 4.4.1 Docker Compose 配置 (`docker/docker-compose.devnet.yml`)
+
+**新增服务**：
+- `init`：用于初始化 Bootstrap 的容器
+- `raiko-sgx-server`：独立的 SGX Server 服务
+- 支持 devnet 特定的环境变量
+
+**关键环境变量**：
+- `DEVNET_RPC`：Devnet RPC 端点
+- `SGX_PACAYA_INSTANCE_ID`：SGX 实例 ID
+- `SGXGETH_PACAYA_INSTANCE_ID`：SGX Geth 实例 ID
+
+#### 4.4.2 链规格配置 (`host/config/chain_spec_list_default.json`)
+
+添加了 devnet 网络的链规格定义，包括：
+- Chain ID
+- 网络名称
+- RPC 端点配置
+
+#### 4.4.3 Genesis 配置 (`dev.genesis.json`)
+
+定义了 devnet 网络的初始状态：
+- 初始账户和余额
+- 初始合约代码
+- 网络参数（gas limit、base fee 等）
+
+### 4.5 新增验证器模块 (`provers/sgx/verifier/`)
+
+devnet 分支添加了一个完整的 SGX 证明验证器模块：
+
+**主要组件**：
+- `main.rs`：验证器主程序（712 行）
+- `proof.rs`：证明验证逻辑
+- `quote.rs`：SGX Quote 验证
+- `signature.rs`：签名验证
+
+**功能**：
+- 验证 SGX 证明的有效性
+- 验证 Quote 的完整性
+- 验证签名链
+
+### 4.6 开发指南
+
+#### 4.6.1 添加新网络支持
+
+要添加对新网络的支持，需要：
+
+1. **添加链规格**：
+   - 在 `lib/src/builder.rs` 的 `get_chain_spec` 方法中添加新网络
+   - 创建或导入对应的 `ChainSpec`
+
+2. **添加 Genesis 配置**（如需要）：
+   - 创建 `genesis.json` 文件
+   - 在代码中加载并构建 `ChainSpec`
+
+3. **更新配置文件**：
+   - 在 `host/config/chain_spec_list_default.json` 中添加网络定义
+   - 在 `docker-compose.devnet.yml` 中添加对应的环境变量
+
+#### 4.6.2 修改批量证明逻辑
+
+批量证明的核心逻辑在以下文件中：
+
+1. **`lib/src/protocol_instance.rs`**：
+   - `create_batch_metadata`：创建批量元数据
+   - `create_batch_transition`：创建批量状态转换
+
+2. **`lib/src/builder.rs`**：
+   - `calculate_batch_blocks_final_header`：计算批量区块的最终区块头
+
+3. **`core/src/lib.rs`**：
+   - `generate_continuous_batch_input`：生成批量输入
+   - `prove_continuous_blocks`：生成批量证明
+
+#### 4.6.3 调试技巧
+
+1. **查看日志**：
+   ```bash
+   docker compose -f docker-compose.devnet.yml logs -f raiko
+   docker compose -f docker-compose.devnet.yml logs -f raiko-sgx-server
+   ```
+
+2. **检查 Bootstrap 状态**：
+   ```bash
+   cat ~/.config/raiko/config/bootstrap.json
+   ```
+
+3. **验证服务状态**：
+   ```bash
+   curl http://localhost:8080/health
+   curl http://localhost:9090/check
+   ```
+
+4. **清理并重新部署**：
+   ```bash
+   rm -rf ~/.config/raiko/secrets/*
+   rm -f ~/.config/raiko/config/bootstrap.json
+   # 然后重新运行 auto.sh
+   ```
+
+### 4.7 与 main 分支的主要差异总结
+
+| 模块 | main 分支 | devnet 分支 |
+|------|----------|------------|
+| **协议支持** | 仅支持 Taiko 协议 | 支持通用区块链网络 |
+| **批量证明** | 仅支持 Taiko 批量证明 | 支持任意连续区块批量证明 |
+| **Anchor 交易** | 必需 | 可选（非 Taiko 链） |
+| **网络支持** | Taiko 网络 | 包括 devnet 在内的多种网络 |
+| **部署脚本** | 基础脚本 | 完整的自动化部署脚本 |
+| **验证工具** | 基础验证 | 完整的批量证明验证工具 |
+
+### 4.8 注意事项
+
+1. **Bootstrap 清理**：
+   - 重复部署时必须清理 `~/.config/raiko/secrets/` 目录
+   - 否则会导致 Bootstrap 失败
+
+2. **网络配置**：
+   - 确保 RPC 端点可访问
+   - 检查网络 ID 和 Chain ID 配置
+
+3. **SGX 硬件要求**：
+   - 需要支持 SGX 的 Intel CPU
+   - 需要足够的 EPC 内存（建议 4GB+）
+
+4. **Docker Compose 文件**：
+   - devnet 分支使用 `docker-compose.devnet.yml`
+   - 确保所有服务正确配置
+
+5. **环境变量**：
+   - 正确设置 `DEVNET_RPC`
+   - 配置 `SGX_PACAYA_INSTANCE_ID` 和 `SGXGETH_PACAYA_INSTANCE_ID`
+
+### 4.9 未来扩展方向
+
+1. **更多网络支持**：添加对其他测试网络和主网的支持
+2. **性能优化**：优化批量证明的生成速度
+3. **错误恢复**：改进错误处理和恢复机制
+4. **监控和指标**：添加更详细的监控和性能指标
+5. **文档完善**：持续完善开发文档和 API 文档
+
+---
+
+通过本章节的介绍，您应该对 devnet 分支的二次开发有了全面的了解。如需进一步的技术支持，请参考相关源代码和注释。
 
