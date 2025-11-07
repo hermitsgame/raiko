@@ -233,6 +233,85 @@ impl BlockMetaDataFork {
                     proposedAt: batch_proposed.meta.proposedAt,
                 })
             }
+            BlockProposedFork::Nothing => {
+                // For non-Taiko chains or generic continuous blocks, create BatchMetadata from actual block data
+                let txs_hash = Self::calculate_pacaya_txs_hash(
+                    keccak(batch_input.taiko.tx_data_from_calldata.as_slice()).into(),
+                    &vec![], // No blob hashes for generic continuous blocks
+                );
+                
+                let ts_base = final_blocks.first().unwrap().timestamp;
+                let (_, blocks) = final_blocks
+                    .iter()
+                    .enumerate()
+                    .fold(
+                        (ts_base, Vec::new()),
+                        |parent_ts_with_block_params, (index, block)| {
+                            let (parent_ts, mut block_params) = parent_ts_with_block_params;
+                            // For non-Taiko chains, calculate time shift from actual timestamps
+                            let time_shift = if index == 0 {
+                                0 // First block uses base timestamp
+                            } else {
+                                (block.timestamp - parent_ts) as u8
+                            };
+                            
+                            // Count transactions (excluding anchor tx if present)
+                            let num_txs = if batch_input.inputs[index].taiko.anchor_tx.is_some() {
+                                block.body.len().saturating_sub(1) as u16
+                            } else {
+                                block.body.len() as u16
+                            };
+                            
+                            block_params.push(BlockParams {
+                                numTransactions: num_txs,
+                                timeShift: time_shift,
+                                signalSlots: vec![], // No signal slots for generic continuous blocks
+                            });
+                            (block.timestamp, block_params)
+                        },
+                    );
+                
+                // Use actual block data for metadata
+                let first_block = final_blocks.first().unwrap();
+                let last_block = final_blocks.last().unwrap();
+                let extra_data = bytes_to_bytes32(&first_block.header.extra_data).into();
+                let coinbase = first_block.header.beneficiary;
+                let gas_limit = first_block.header.gas_limit as u32;
+                let last_block_id = last_block.header.number;
+                let last_block_timestamp = last_block.header.timestamp;
+                let anchor_block_id = batch_input.taiko.l1_header.number;
+                let anchor_block_hash = batch_input.taiko.l1_header.hash_slow();
+                
+                // Use default base fee config for generic continuous blocks
+                let base_fee_config = crate::input::pacaya::BaseFeeConfig::default();
+                
+                BlockMetaDataFork::Pacaya(BatchMetadata {
+                    infoHash: keccak(
+                        BatchInfo {
+                            txsHash: txs_hash,
+                            blocks,
+                            blobHashes: vec![], // No blob hashes for generic continuous blocks
+                            extraData: extra_data,
+                            coinbase,
+                            proposedIn: 0, // Not applicable for generic continuous blocks
+                            blobCreatedIn: 0,
+                            blobByteOffset: 0,
+                            blobByteSize: 0,
+                            gasLimit: gas_limit,
+                            lastBlockId: last_block_id,
+                            lastBlockTimestamp: last_block_timestamp,
+                            anchorBlockId: anchor_block_id,
+                            anchorBlockHash: anchor_block_hash,
+                            baseFeeConfig: base_fee_config,
+                        }
+                        .abi_encode(),
+                    )
+                    .into(),
+                    proposer: Address::ZERO, // Not applicable for generic continuous blocks
+                    batchId: batch_input.taiko.batch_id,
+                    proposedAt: 0, // Not applicable for generic continuous blocks
+                })
+            }
             _ => {
                 unimplemented!("batch blocks signature is not supported before pacaya fork")
             }
@@ -557,6 +636,15 @@ impl ProtocolInstance {
                 blockHash: last_block.header.hash_slow(),
                 stateRoot: last_block.header.state_root,
             }),
+            BlockProposedFork::Nothing => {
+                // For non-Taiko chains or generic continuous blocks, use a generic transition
+                // We use Pacaya transition structure as it's the most general form
+                TransitionFork::Pacaya(PacayaTransition {
+                    parentHash: first_block.header.parent_hash,
+                    blockHash: last_block.header.hash_slow(),
+                    stateRoot: last_block.header.state_root,
+                })
+            }
             _ => return Err(anyhow::Error::msg("unknown transition fork")),
         };
 

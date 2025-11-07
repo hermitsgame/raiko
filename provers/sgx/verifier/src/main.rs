@@ -7,9 +7,9 @@ use raiko_core::{
     Raiko,
 };
 use raiko_lib::{
-    builder::calculate_block_header,
+    builder::{calculate_batch_blocks_final_header, calculate_block_header},
     consts::SupportedChainSpecs,
-    input::GuestInput,
+    input::{GuestBatchInput, GuestInput},
     primitives::{Address, B256},
     proof_type::ProofType,
     protocol_instance::ProtocolInstance,
@@ -40,13 +40,33 @@ struct Args {
     #[arg(long)]
     generate_guest_input: bool,
     
+    /// Verify batch proof instead of single block proof
+    #[arg(long)]
+    batch: bool,
+    
+    /// Path to JSON file containing GuestBatchInput for batch proof verification (optional)
+    #[arg(long)]
+    batch_guest_input: Option<String>,
+    
+    /// Generate GuestBatchInput via RPC for batch proof verification (requires --network, --start-block, --end-block, etc.)
+    #[arg(long)]
+    generate_batch_guest_input: bool,
+    
     /// Network name (e.g., devnet, taiko_a7, taiko_mainnet)
     #[arg(long)]
     network: Option<String>,
     
-    /// Block number to generate GuestInput for
+    /// Block number to generate GuestInput for (single block)
     #[arg(long)]
     block_number: Option<u64>,
+    
+    /// Start block number for batch proof (inclusive)
+    #[arg(long)]
+    start_block: Option<u64>,
+    
+    /// End block number for batch proof (inclusive)
+    #[arg(long)]
+    end_block: Option<u64>,
     
     /// L1 network name (e.g., ethereum, holesky, devnet)
     #[arg(long)]
@@ -117,39 +137,79 @@ async fn main() -> Result<()> {
     let proof_json: SgxProofJson = serde_json::from_str(&json_content)
         .map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
 
-    // Load or generate GuestInput
-    let guest_input: Option<GuestInput> = if args.generate_guest_input {
-        // Generate GuestInput via RPC
-        let block_number = args.block_number
-            .ok_or_else(|| anyhow!("--block-number is required when using --generate-guest-input"))?;
-        eprintln!("Generating GuestInput via RPC for block {} on network {}...", block_number, args.network.as_ref().unwrap_or(&"unknown".to_string()));
-        let guest_input = generate_guest_input_via_rpc(&args, block_number).await?;
-        eprintln!("GuestInput generated successfully");
-        Some(guest_input)
-    } else if let Some(guest_input_path) = args.guest_input {
-        // Load from file
-        eprintln!("Loading GuestInput from file: {}", guest_input_path);
-        let guest_input_content = std::fs::read_to_string(&guest_input_path)
-            .map_err(|e| anyhow!("Failed to read guest input file {}: {}", guest_input_path, e))?;
-        Some(serde_json::from_str(&guest_input_content)
-            .map_err(|e| anyhow!("Failed to parse guest input JSON: {}", e))?)
+    // Load or generate GuestInput/GuestBatchInput
+    if args.batch {
+        // Batch proof verification
+        let batch_guest_input: Option<GuestBatchInput> = if args.generate_batch_guest_input {
+            // Generate GuestBatchInput via RPC
+            let start_block = args.start_block
+                .ok_or_else(|| anyhow!("--start-block is required when using --generate-batch-guest-input"))?;
+            let end_block = args.end_block
+                .ok_or_else(|| anyhow!("--end-block is required when using --generate-batch-guest-input"))?;
+            eprintln!("Generating GuestBatchInput via RPC for blocks {} to {} on network {}...", 
+                start_block, end_block, args.network.as_ref().unwrap_or(&"unknown".to_string()));
+            let batch_guest_input = generate_batch_guest_input_via_rpc(&args, start_block, end_block).await?;
+            eprintln!("GuestBatchInput generated successfully");
+            Some(batch_guest_input)
+        } else if let Some(batch_guest_input_path) = args.batch_guest_input {
+            // Load from file
+            eprintln!("Loading GuestBatchInput from file: {}", batch_guest_input_path);
+            let batch_guest_input_content = std::fs::read_to_string(&batch_guest_input_path)
+                .map_err(|e| anyhow!("Failed to read batch guest input file {}: {}", batch_guest_input_path, e))?;
+            Some(serde_json::from_str(&batch_guest_input_content)
+                .map_err(|e| anyhow!("Failed to parse batch guest input JSON: {}", e))?)
+        } else {
+            None
+        };
+
+        // Verify the batch proof
+        let result = verify_sgx_batch_proof(&proof_json, batch_guest_input.as_ref())?;
+        
+        // Output result as JSON
+        let output = serde_json::to_string_pretty(&result)?;
+        println!("{}", output);
+
+        // Exit with error code if verification failed
+        if !result.valid {
+            std::process::exit(1);
+        }
+
+        Ok(())
     } else {
-        None
-    };
+        // Single block proof verification
+        let guest_input: Option<GuestInput> = if args.generate_guest_input {
+            // Generate GuestInput via RPC
+            let block_number = args.block_number
+                .ok_or_else(|| anyhow!("--block-number is required when using --generate-guest-input"))?;
+            eprintln!("Generating GuestInput via RPC for block {} on network {}...", block_number, args.network.as_ref().unwrap_or(&"unknown".to_string()));
+            let guest_input = generate_guest_input_via_rpc(&args, block_number).await?;
+            eprintln!("GuestInput generated successfully");
+            Some(guest_input)
+        } else if let Some(guest_input_path) = args.guest_input {
+            // Load from file
+            eprintln!("Loading GuestInput from file: {}", guest_input_path);
+            let guest_input_content = std::fs::read_to_string(&guest_input_path)
+                .map_err(|e| anyhow!("Failed to read guest input file {}: {}", guest_input_path, e))?;
+            Some(serde_json::from_str(&guest_input_content)
+                .map_err(|e| anyhow!("Failed to parse guest input JSON: {}", e))?)
+        } else {
+            None
+        };
 
-    // Verify the proof
-    let result = verify_sgx_proof(&proof_json, guest_input.as_ref())?;
+        // Verify the proof
+        let result = verify_sgx_proof(&proof_json, guest_input.as_ref())?;
 
-    // Output result as JSON
-    let output = serde_json::to_string_pretty(&result)?;
-    println!("{}", output);
+        // Output result as JSON
+        let output = serde_json::to_string_pretty(&result)?;
+        println!("{}", output);
 
-    // Exit with error code if verification failed
-    if !result.valid {
-        std::process::exit(1);
+        // Exit with error code if verification failed
+        if !result.valid {
+            std::process::exit(1);
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn verify_sgx_proof(proof_json: &SgxProofJson, guest_input: Option<&GuestInput>) -> Result<VerificationResult> {
@@ -412,5 +472,241 @@ async fn generate_guest_input_via_rpc(args: &Args, block_number: u64) -> Result<
     }
     
     Ok(guest_input)
+}
+
+/// Verify SGX batch proof
+fn verify_sgx_batch_proof(proof_json: &SgxProofJson, batch_guest_input: Option<&GuestBatchInput>) -> Result<VerificationResult> {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Parse proof bytes
+    let proof_bytes = hex::decode(proof_json.proof.strip_prefix("0x").unwrap_or(&proof_json.proof))
+        .map_err(|e| anyhow!("Failed to decode proof hex: {}", e))?;
+
+    let proof = match parse_proof_bytes(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(format!("Failed to parse proof bytes: {}", e));
+            return Ok(VerificationResult {
+                valid: false,
+                errors,
+                warnings,
+                proof_info: None,
+                quote_info: None,
+            });
+        }
+    };
+
+    // Parse input hash
+    let input_hash = hex::decode(proof_json.input.strip_prefix("0x").unwrap_or(&proof_json.input))
+        .map_err(|e| anyhow!("Failed to decode input hash: {}", e))?;
+    if input_hash.len() != 32 {
+        errors.push(format!("Invalid input hash length: expected 32 bytes, got {}", input_hash.len()));
+    }
+    let input_hash = B256::from_slice(&input_hash);
+
+    // If GuestBatchInput is provided, verify that the instance_hash matches
+    if let Some(batch_guest_input) = batch_guest_input {
+        match verify_batch_instance_hash(batch_guest_input, &proof.new_instance_address, &input_hash) {
+            Ok(()) => {
+                // Instance hash matches, this is good
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "Instance hash verification failed: calculated hash does not match proof input hash. {}",
+                    e
+                ));
+                warnings.push(
+                    "This may be due to different parameters or block data. "
+                    .to_string() +
+                    "Signature and quote verification are still performed."
+                );
+            }
+        }
+    } else {
+        warnings.push(
+            "GuestBatchInput not provided. Skipping instance hash verification. "
+            .to_string() +
+            "For full verification, provide GuestBatchInput using --batch-guest-input flag."
+        );
+    }
+
+    // Verify signature (for batch proof, signature should match new_instance_address)
+    match signature::recover_signer(&proof.signature, &input_hash) {
+        Ok(recovered_address) => {
+            if recovered_address != proof.new_instance_address {
+                errors.push(format!(
+                    "Signature verification failed: recovered address {} does not match expected signer {}",
+                    recovered_address, proof.new_instance_address
+                ));
+            }
+        }
+        Err(e) => {
+            errors.push(format!("Failed to recover signer from signature: {}", e));
+        }
+    }
+
+    // Verify instance address matches if provided (only if not empty)
+    if let Some(ref expected_addr) = proof_json.instance_address {
+        if !expected_addr.is_empty() {
+            let addr_hex = expected_addr.strip_prefix("0x").unwrap_or(expected_addr);
+            let addr_bytes = hex::decode(addr_hex)
+                .map_err(|e| anyhow!("Failed to decode instance_address: {}", e))?;
+            if addr_bytes.len() != 20 {
+                errors.push(format!("Invalid instance_address length: expected 20 bytes, got {}", addr_bytes.len()));
+            } else {
+                let expected = Address::from_slice(&addr_bytes);
+                if expected != proof.new_instance_address {
+                    errors.push(format!(
+                        "Instance address mismatch: expected {}, got {}",
+                        expected, proof.new_instance_address
+                    ));
+                }
+            }
+        }
+    }
+
+    // Parse and verify quote
+    let quote_bytes = hex::decode(proof_json.quote.strip_prefix("0x").unwrap_or(&proof_json.quote))
+        .map_err(|e| anyhow!("Failed to decode quote hex: {}", e))?;
+
+    let quote_info = match quote::parse_quote(&quote_bytes) {
+        Ok(info) => {
+            // Verify REPORTDATA contains instance address
+            if let Some(report_data_addr) = info.report_data_address {
+                if report_data_addr != proof.new_instance_address {
+                    warnings.push(format!(
+                        "Quote REPORTDATA address {} does not match proof new instance address {}",
+                        report_data_addr, proof.new_instance_address
+                    ));
+                }
+            }
+            Some(info)
+        }
+        Err(e) => {
+            warnings.push(format!("Failed to parse quote (continuing anyway): {}", e));
+            None
+        }
+    };
+
+    let valid = errors.is_empty();
+
+    Ok(VerificationResult {
+        valid,
+        errors,
+        warnings,
+        proof_info: Some(ProofInfo {
+            proof_type: "batch".to_string(),
+            instance_id: proof.instance_id,
+            new_instance_address: proof.new_instance_address,
+            input_hash,
+        }),
+        quote_info,
+    })
+}
+
+/// Verify that the instance_hash calculated from GuestBatchInput matches the provided input_hash
+fn verify_batch_instance_hash(
+    batch_guest_input: &GuestBatchInput,
+    instance_address: &Address,
+    expected_hash: &B256,
+) -> Result<()> {
+    // Calculate final blocks from batch input
+    let blocks = calculate_batch_blocks_final_header(batch_guest_input);
+    
+    // Build ProtocolInstance for batch
+    let pi = ProtocolInstance::new_batch(batch_guest_input, blocks, ProofType::Sgx)
+        .map_err(|e| anyhow!("Failed to create ProtocolInstance for batch: {}", e))?
+        .sgx_instance(*instance_address);
+    
+    // Calculate instance hash
+    let calculated_hash = pi.instance_hash();
+    
+    if calculated_hash != *expected_hash {
+        return Err(anyhow!(
+            "Batch instance hash mismatch: calculated {} but proof has {}",
+            calculated_hash,
+            expected_hash
+        ));
+    }
+    
+    Ok(())
+}
+
+/// Generate GuestBatchInput via RPC using the same code as Raiko
+async fn generate_batch_guest_input_via_rpc(args: &Args, start_block: u64, end_block: u64) -> Result<GuestBatchInput> {
+    let network = args.network.as_ref()
+        .ok_or_else(|| anyhow!("--network is required when using --generate-batch-guest-input"))?;
+    let l1_network = args.l1_network.as_ref()
+        .ok_or_else(|| anyhow!("--l1-network is required when using --generate-batch-guest-input"))?;
+    
+    let prover = args.prover.as_ref()
+        .map(|s| s.parse::<Address>())
+        .transpose()
+        .map_err(|e| anyhow!("Invalid prover address: {}", e))?
+        .unwrap_or_else(|| "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".parse().unwrap());
+    
+    let graffiti = args.graffiti.as_ref()
+        .map(|s| s.parse::<B256>())
+        .transpose()
+        .map_err(|e| anyhow!("Invalid graffiti: {}", e))?
+        .unwrap_or_else(|| "8008500000000000000000000000000000000000000000000000000000000000".parse().unwrap());
+    
+    // Get chain specs
+    let chain_specs = SupportedChainSpecs::default();
+    let taiko_chain_spec = chain_specs.get_chain_spec(network)
+        .ok_or_else(|| anyhow!("Unknown network: {}", network))?;
+    let l1_chain_spec = chain_specs.get_chain_spec(l1_network)
+        .ok_or_else(|| anyhow!("Unknown L1 network: {}", l1_network))?;
+    
+    // Override RPC URL if provided
+    let mut taiko_chain_spec = taiko_chain_spec.clone();
+    if let Some(rpc_url) = &args.rpc_url {
+        taiko_chain_spec.rpc = rpc_url.clone();
+    }
+    
+    // Create proof request
+    let proof_request = ProofRequest {
+        block_number: 0,
+        batch_id: 0, // Use 0 for continuous blocks
+        l1_inclusion_block_number: 0, // Not used for continuous blocks
+        network: network.clone(),
+        l1_network: l1_network.clone(),
+        graffiti,
+        prover,
+        proof_type: ProofType::Sgx,
+        blob_proof_type: raiko_lib::input::BlobProofType::ProofOfEquivalence,
+        prover_args: {
+            let mut args = std::collections::HashMap::new();
+            args.insert("start_block".to_string(), serde_json::Value::Number(start_block.into()));
+            args.insert("end_block".to_string(), serde_json::Value::Number(end_block.into()));
+            args
+        },
+        l2_block_numbers: (start_block..=end_block).collect(),
+    };
+    
+    // Create Raiko instance
+    let raiko = Raiko::new(
+        l1_chain_spec.clone(),
+        taiko_chain_spec.clone(),
+        proof_request.clone(),
+    );
+    
+    // Create RPC provider for batch blocks
+    let provider_target_blocks: Vec<u64> = (start_block.saturating_sub(1)..=end_block).collect();
+    let provider = RpcBlockDataProvider::new_batch(&taiko_chain_spec.rpc, provider_target_blocks)
+        .await
+        .map_err(|e| anyhow!("Failed to create RPC provider: {}", e))?;
+    
+    // Generate GuestBatchInput
+    let batch_guest_input = raiko.generate_continuous_batch_input(provider, start_block, end_block)
+        .await
+        .map_err(|e| anyhow!("Failed to generate GuestBatchInput: {}", e))?;
+    
+    // Log the block range that was processed
+    eprintln!("Generated GuestBatchInput for blocks {} to {} ({} blocks)", 
+        start_block, end_block, end_block - start_block + 1);
+    
+    Ok(batch_guest_input)
 }
 

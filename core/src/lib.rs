@@ -100,6 +100,50 @@ impl Raiko {
             .map_err(Into::<RaikoError>::into)
     }
 
+    /// Generate batch input for continuous blocks (supports any chain, not just Taiko)
+    pub async fn generate_continuous_batch_input<BDP: BlockDataProvider>(
+        &self,
+        provider: BDP,
+        start_block: u64,
+        end_block: u64,
+    ) -> RaikoResult<GuestBatchInput> {
+        if start_block >= end_block {
+            return Err(RaikoError::InvalidRequestConfig(
+                "start_block must be less than end_block".to_string(),
+            ));
+        }
+        if end_block - start_block > 1000 {
+            return Err(RaikoError::InvalidRequestConfig(
+                "block range too large, maximum 1000 blocks supported".to_string(),
+            ));
+        }
+
+        let block_numbers: Vec<u64> = (start_block..=end_block).collect();
+        info!(
+            "Generating continuous batch input for blocks {} to {} ({} blocks)",
+            start_block,
+            end_block,
+            block_numbers.len()
+        );
+
+        let preflight_data = BatchPreflightData {
+            batch_id: 0, // Use 0 for generic continuous batches
+            block_numbers,
+            l1_inclusion_block_number: 0, // Not used for non-Taiko chains
+            l1_chain_spec: self.l1_chain_spec.clone(),
+            taiko_chain_spec: self.taiko_chain_spec.clone(),
+            prover_data: TaikoProverData {
+                graffiti: self.request.graffiti,
+                prover: self.request.prover,
+            },
+            blob_proof_type: self.request.blob_proof_type.clone(),
+        };
+
+        batch_preflight(provider, preflight_data)
+            .await
+            .map_err(Into::<RaikoError>::into)
+    }
+
     pub fn get_output(&self, input: &GuestInput) -> RaikoResult<GuestOutput> {
         let db = create_mem_db(&mut input.clone()).unwrap();
         let mut builder = RethBlockBuilder::new(input, db);
@@ -182,7 +226,12 @@ impl Raiko {
         let db = create_mem_db(&mut input.clone()).unwrap();
         let mut builder = RethBlockBuilder::new(input, db);
 
-        let mut pool_txs = vec![input.taiko.anchor_tx.clone().unwrap()];
+        // For Taiko chains, anchor_tx is required; for non-Taiko chains, it's None
+        let mut pool_txs = if let Some(ref anchor_tx) = input.taiko.anchor_tx {
+            vec![anchor_tx.clone()]
+        } else {
+            Vec::new()
+        };
         pool_txs.extend_from_slice(&origin_pool_txs);
 
         builder
@@ -235,6 +284,26 @@ impl Raiko {
     ) -> RaikoResult<Proof> {
         let config = serde_json::to_value(&self.request)?;
         run_batch_prover(self.request.proof_type, input, output, &config, store).await
+    }
+
+    /// Prove continuous blocks (supports any chain, not just Taiko)
+    /// This method generates a single proof for multiple continuous blocks
+    pub async fn prove_continuous_blocks<BDP: BlockDataProvider>(
+        &self,
+        provider: BDP,
+        start_block: u64,
+        end_block: u64,
+    ) -> RaikoResult<Proof> {
+        // Generate batch input for continuous blocks
+        let input = self
+            .generate_continuous_batch_input(provider, start_block, end_block)
+            .await?;
+
+        // Generate batch output
+        let output = self.get_batch_output(&input)?;
+
+        // Generate proof
+        self.batch_prove(input, &output, None).await
     }
 
     pub async fn cancel(

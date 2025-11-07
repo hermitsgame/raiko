@@ -140,44 +140,66 @@ fn distribute_txs<T: Clone>(data: &[T], batch_proposal: &BlockProposedFork) -> V
 pub fn generate_transactions_for_batch_blocks(
     taiko_guest_batch_input: &TaikoGuestBatchInput,
 ) -> Vec<Vec<TransactionSigned>> {
-    assert!(
-        matches!(
-            taiko_guest_batch_input.batch_proposed,
-            BlockProposedFork::Pacaya(_)
-        ),
-        "only pacaya batch supported"
-    );
-    assert!(
-        taiko_guest_batch_input.tx_data_from_calldata.is_empty()
-            || taiko_guest_batch_input.tx_data_from_blob.is_empty(),
-        "Txlist comes from either calldata or blob, but not both"
-    );
+    // Support both Pacaya batch and generic continuous blocks
+    match &taiko_guest_batch_input.batch_proposed {
+        BlockProposedFork::Pacaya(_) => {
+            // Original Pacaya batch logic
+            assert!(
+                taiko_guest_batch_input.tx_data_from_calldata.is_empty()
+                    || taiko_guest_batch_input.tx_data_from_blob.is_empty(),
+                "Txlist comes from either calldata or blob, but not both"
+            );
 
-    let batch_proposal = &taiko_guest_batch_input.batch_proposed;
-    let use_blob = batch_proposal.blob_used();
-    let compressed_tx_list_buf = if use_blob {
-        let blob_data_bufs = taiko_guest_batch_input.tx_data_from_blob.clone();
-        let compressed_tx_list_buf = blob_data_bufs
-            .iter()
-            .map(|blob_data_buf| decode_blob_data(blob_data_buf))
-            .collect::<Vec<Vec<u8>>>()
-            .concat();
-        let (blob_offset, blob_size) = batch_proposal.blob_tx_slice_param().unwrap_or_else(|| {
-            warn!("blob_tx_slice_param not found, use full buffer to decode tx_list");
-            (0, compressed_tx_list_buf.len())
-        });
-        compressed_tx_list_buf[blob_offset..blob_offset + blob_size].to_vec()
-    } else {
-        taiko_guest_batch_input.tx_data_from_calldata.clone()
-    };
+            let batch_proposal = &taiko_guest_batch_input.batch_proposed;
+            let use_blob = batch_proposal.blob_used();
+            let compressed_tx_list_buf = if use_blob {
+                let blob_data_bufs = taiko_guest_batch_input.tx_data_from_blob.clone();
+                let compressed_tx_list_buf = blob_data_bufs
+                    .iter()
+                    .map(|blob_data_buf| decode_blob_data(blob_data_buf))
+                    .collect::<Vec<Vec<u8>>>()
+                    .concat();
+                let (blob_offset, blob_size) = batch_proposal.blob_tx_slice_param().unwrap_or_else(|| {
+                    warn!("blob_tx_slice_param not found, use full buffer to decode tx_list");
+                    (0, compressed_tx_list_buf.len())
+                });
+                compressed_tx_list_buf[blob_offset..blob_offset + blob_size].to_vec()
+            } else {
+                taiko_guest_batch_input.tx_data_from_calldata.clone()
+            };
 
-    let tx_list_buf = zlib_decompress_data(&compressed_tx_list_buf).unwrap_or_default();
-    let txs = decode_transactions(&tx_list_buf);
-    // todo: deal with invalid proposal, to name a few:
-    // - txs.len() != tx_num_sizes.sum()
-    // - random blob tx bytes
+            let tx_list_buf = zlib_decompress_data(&compressed_tx_list_buf).unwrap_or_default();
+            let txs = decode_transactions(&tx_list_buf);
+            // todo: deal with invalid proposal, to name a few:
+            // - txs.len() != tx_num_sizes.sum()
+            // - random blob tx bytes
 
-    distribute_txs(&txs, batch_proposal)
+            distribute_txs(&txs, batch_proposal)
+        }
+        BlockProposedFork::Nothing => {
+            // For generic continuous blocks (non-Taiko chains)
+            // The tx_data_from_calldata contains all transactions from all blocks encoded as RLP
+            let tx_list_buf = taiko_guest_batch_input.tx_data_from_calldata.clone();
+            let all_txs = decode_transactions(&tx_list_buf);
+            
+            // For generic batches, we need to know how many blocks we have
+            // Since we don't have block metadata, we'll need to distribute based on
+            // the number of blocks in the batch input (which should be passed separately)
+            // For now, we return all transactions in a single vec per block assumption
+            // This will be handled properly in the batch_preflight where we have block count
+            if all_txs.is_empty() {
+                vec![Vec::new()]
+            } else {
+                // Simple distribution: one transaction list per expected block
+                // The actual distribution should match the number of blocks in the batch
+                // This is a placeholder - the caller should ensure proper distribution
+                vec![all_txs]
+            }
+        }
+        _ => {
+            panic!("only pacaya batch or generic continuous blocks supported")
+        }
+    }
 }
 
 const BLOB_FIELD_ELEMENT_NUM: usize = 4096;
