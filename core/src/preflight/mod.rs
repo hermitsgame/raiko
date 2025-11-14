@@ -1,6 +1,7 @@
 use std::{collections::HashSet, env};
 
 use crate::{
+    cassandra,
     interfaces::{RaikoError, RaikoResult},
     provider::{db::ProviderDb, rpc::RpcBlockDataProvider, BlockDataProvider},
 };
@@ -15,7 +16,7 @@ use raiko_lib::{
     Measurement,
 };
 use reth_primitives::TransactionSigned;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use util::{
     execute_txs, get_batch_blocks_and_parent_data, get_block_and_parent_data,
@@ -419,13 +420,48 @@ pub async fn batch_preflight<BDP: BlockDataProvider>(
                 measurement.stop();
 
                 // Fill in remaining generated guest input data
-                let input = GuestInput {
+                let mut input = GuestInput {
                     parent_state_trie,
                     parent_storage,
                     contracts,
                     ancestor_headers,
                     ..input
                 };
+                
+                // For devnet with Kaspa L1, fetch VSPC list from Cassandra
+                if taiko_chain_spec.name == "devnet" {
+                    // Extract daaScore from block.extra_data[:8] (matching verify_block.go)
+                    if input.block.header.extra_data.len() >= 8 {
+                        let daa_score_bytes = &input.block.header.extra_data[0..8];
+                        let daa_score = u64::from_be_bytes([
+                            daa_score_bytes[0],
+                            daa_score_bytes[1],
+                            daa_score_bytes[2],
+                            daa_score_bytes[3],
+                            daa_score_bytes[4],
+                            daa_score_bytes[5],
+                            daa_score_bytes[6],
+                            daa_score_bytes[7],
+                        ]);
+                        
+                        info!("Fetching VSPC list for batch block {} (daaScore: {})", input.block.header.number, daa_score);
+                        match cassandra::get_vspc_list(daa_score).await {
+                            Ok(vspc_list) => {
+                                info!("Successfully fetched {} VSPC entries for batch block {}", vspc_list.len(), input.block.header.number);
+                                input.vspc_list = Some(vspc_list);
+                            }
+                            Err(e) => {
+                                warn!("Failed to fetch VSPC list from Cassandra for batch block {}: {}. MixHash verification will be skipped.", 
+                                    input.block.header.number, e);
+                                // Don't fail, just log a warning - vspc_list will remain None
+                            }
+                        }
+                    } else {
+                        warn!("Batch block {} extra_data too short (length: {}), need at least 8 bytes for daaScore. MixHash verification will be skipped.", 
+                            input.block.header.number, input.block.header.extra_data.len());
+                    }
+                }
+                
                 chunk_guest_input.push(input);
             }
             Ok(chunk_guest_input)

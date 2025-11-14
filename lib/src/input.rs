@@ -42,6 +42,9 @@ pub struct GuestInput {
     pub ancestor_headers: Vec<Header>,
     /// Taiko specific data
     pub taiko: TaikoGuestInput,
+    /// VSPC list for MixHash verification (used for devnet with Kaspa L1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vspc_list: Option<Vec<Vspc>>,
 }
 
 /// External block input.
@@ -277,6 +280,15 @@ pub struct TaikoProverData {
     pub graffiti: B256,
 }
 
+/// VSPC (Virtual Selected Parent Chain) entry from Kaspa
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Vspc {
+    /// DAA (Difficulty Adjustment Algorithm) score
+    pub daa_score: u64,
+    /// Hash of the VSPC entry
+    pub hash: B256,
+}
+
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestOutput {
@@ -322,6 +334,7 @@ mod test {
             contracts: vec![],
             ancestor_headers: vec![],
             taiko: TaikoGuestInput::default(),
+            vspc_list: None,
         };
         let input_ser = serde_json::to_string(&input).unwrap();
         let input_de: GuestInput = serde_json::from_str(&input_ser).unwrap();
@@ -339,6 +352,7 @@ mod test {
             contracts: vec![],
             ancestor_headers: vec![],
             taiko: TaikoGuestInput::default(),
+            vspc_list: None,
         };
         let input_ser = serde_json::to_value(&input).unwrap();
         let input_de: GuestInput = serde_json::from_value(input_ser).unwrap();

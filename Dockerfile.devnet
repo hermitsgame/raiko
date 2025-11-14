@@ -1,7 +1,24 @@
 FROM rust:1.85.0 AS chef
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 RUN cargo binstall -y cargo-chef wild-linker
-RUN apt-get update && apt-get install -y clang
+RUN apt-get update && apt-get install -y \
+    clang \
+    cmake \
+    make \
+    g++ \
+    pkg-config \
+    libssl-dev \
+    libuv1-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+# Install DataStax C++ driver for Cassandra
+RUN git clone --depth 1 --branch 2.16.2 https://github.com/datastax/cpp-driver.git /tmp/cpp-driver && \
+    cd /tmp/cpp-driver && \
+    mkdir build && cd build && \
+    cmake .. && \
+    make && \
+    make install && \
+    cd / && rm -rf /tmp/cpp-driver
 WORKDIR /opt/raiko
 ENV DEBIAN_FRONTEND=noninteractive
 ARG BUILD_FLAGS=""
@@ -47,10 +64,20 @@ FROM us-docker.pkg.dev/evmchain/images/raiko:base AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /opt/raiko
 
+# Install runtime dependencies for Cassandra C++ driver
+RUN apt-get update && apt-get install -y \
+    libuv1 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Cassandra C++ driver libraries from builder stage
+COPY --from=builder /usr/local/lib/libcassandra.so* /usr/local/lib/
+
 RUN mkdir -p \
     ./bin \
     ./provers/sgx \
-    /var/log/raiko
+    /var/log/raiko && \
+    ldconfig
 
 COPY --from=builder /opt/raiko/docker/entrypoint.sh ./bin/
 COPY --from=builder /opt/raiko/provers/sgx/config/sgx-guest.docker.manifest.template ./provers/sgx/config/sgx-guest.local.manifest.template
@@ -60,6 +87,7 @@ COPY --from=builder /opt/raiko/host/config/config.devnet.json /etc/raiko/config.
 COPY --from=builder /opt/raiko/host/config/chain_spec_list_default.json /etc/raiko/chain_spec_list_default.json
 COPY --from=builder /opt/raiko/host/config/chain_spec_list_devnet.json /etc/raiko/chain_spec_list_devnet.json
 COPY --from=builder /opt/raiko/dev.genesis.json /etc/raiko/dev.genesis.json
+COPY --from=builder /opt/raiko/sf-class2-root.crt /opt/raiko/sf-class2-root.crt
 COPY --from=builder /opt/raiko/target/release/sgx-guest ./bin/
 COPY --from=builder /opt/raiko/target/release/raiko-host ./bin/
 COPY --from=builder /opt/raiko/target/release/raiko-setup ./bin/

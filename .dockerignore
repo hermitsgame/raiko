@@ -29,6 +29,7 @@
 !/redis-derive
 !/gaiko
 !/dev.genesis.json
+!/sf-class2-root.crt
 
 /provers/sp1/guest/target
 /provers/risc0/guest/target

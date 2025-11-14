@@ -14,6 +14,7 @@ use raiko_lib::{
 use reth_primitives::{Block, Header};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
+use anyhow;
 
 use crate::{
     interfaces::{ProofRequest, RaikoError, RaikoResult},
@@ -21,6 +22,7 @@ use crate::{
     provider::BlockDataProvider,
 };
 
+pub mod cassandra;
 pub mod interfaces;
 pub mod preflight;
 pub mod prover;
@@ -83,9 +85,44 @@ impl Raiko {
         //TODO: read fork from config
         let preflight_data = self.get_preflight_data();
         info!("Generating input for block {}", self.request.block_number);
-        preflight(provider, preflight_data)
+        let mut input = preflight(provider, preflight_data)
             .await
-            .map_err(Into::<RaikoError>::into)
+            .map_err(Into::<RaikoError>::into)?;
+
+        // For devnet with Kaspa L1, fetch VSPC list from Cassandra
+        if self.taiko_chain_spec.name == "devnet" {
+            // Extract daaScore from block.extra_data[:8] (matching verify_block.go)
+            if input.block.header.extra_data.len() >= 8 {
+                let daa_score_bytes = &input.block.header.extra_data[0..8];
+                let daa_score = u64::from_be_bytes([
+                    daa_score_bytes[0],
+                    daa_score_bytes[1],
+                    daa_score_bytes[2],
+                    daa_score_bytes[3],
+                    daa_score_bytes[4],
+                    daa_score_bytes[5],
+                    daa_score_bytes[6],
+                    daa_score_bytes[7],
+                ]);
+                
+                info!("Fetching VSPC list for daaScore: {}", daa_score);
+                match cassandra::get_vspc_list(daa_score).await {
+                    Ok(vspc_list) => {
+                        info!("Successfully fetched {} VSPC entries", vspc_list.len());
+                        input.vspc_list = Some(vspc_list);
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch VSPC list from Cassandra: {}. MixHash verification will be skipped.", e);
+                        // Don't fail, just log a warning - vspc_list will remain None
+                    }
+                }
+            } else {
+                warn!("Block extra_data too short (length: {}), need at least 8 bytes for daaScore. MixHash verification will be skipped.", 
+                    input.block.header.extra_data.len());
+            }
+        }
+
+        Ok(input)
     }
 
     pub async fn generate_batch_input<BDP: BlockDataProvider>(
@@ -167,7 +204,7 @@ impl Raiko {
                 );
                 debug!("Final block header derived successfully. {header:?}");
                 // Check if the header is the expected one
-                check_header(&input.block.header, &header)?;
+                check_header(&input.block.header, &header, input.vspc_list.as_deref())?;
 
                 Ok(GuestOutput {
                     header: header.clone(),
@@ -253,7 +290,7 @@ impl Raiko {
                 );
                 debug!("Final block derived successfully. {block:?}");
                 // Check if the header is the expected one
-                check_header(&input.block.header, &header)?;
+                check_header(&input.block.header, &header, input.vspc_list.as_deref())?;
 
                 Ok(block.clone())
             }
@@ -315,7 +352,7 @@ impl Raiko {
     }
 }
 
-fn check_header(exp: &Header, header: &Header) -> Result<(), RaikoError> {
+fn check_header(exp: &Header, header: &Header, vspc_list: Option<&[raiko_lib::input::Vspc]>) -> Result<(), RaikoError> {
     // Check against the expected value of all fields for easy debugability
     check_eq(&exp.parent_hash, &header.parent_hash, "parent_hash");
     check_eq(&exp.ommers_hash, &header.ommers_hash, "ommers_hash");
@@ -338,7 +375,35 @@ fn check_header(exp: &Header, header: &Header) -> Result<(), RaikoError> {
     check_eq(&exp.gas_limit, &header.gas_limit, "gas_limit");
     check_eq(&exp.gas_used, &header.gas_used, "gas_used");
     check_eq(&exp.timestamp, &header.timestamp, "timestamp");
-    check_eq(&exp.mix_hash, &header.mix_hash, "mix_hash");
+    
+    // For devnet with Kaspa L1, verify MixHash from VSPC list if provided
+    if let Some(vspc_list) = vspc_list {
+        if !vspc_list.is_empty() {
+            info!("Calculating MixHash from {} VSPC entries...", vspc_list.len());
+            let calculated_mix_hash = cassandra::calculate_mix_hash_from_vspc(vspc_list)
+                .map_err(|e| RaikoError::Anyhow(anyhow::anyhow!("Failed to calculate MixHash from VSPC: {}", e)))?;
+            info!("Calculated MixHash from VSPC: {}, Block MixHash: {}", calculated_mix_hash, header.mix_hash);
+            
+            // Use require_eq instead of check_eq to ensure errors are reported
+            if calculated_mix_hash == header.mix_hash {
+                info!("MixHash verified from VSPC list: {}", calculated_mix_hash);
+            } else {
+                error!("MixHash mismatch! Calculated from VSPC: {}, Block MixHash: {}", calculated_mix_hash, header.mix_hash);
+                return Err(RaikoError::Anyhow(anyhow::anyhow!(
+                    "MixHash verification failed: calculated from VSPC: {}, block mix_hash: {}",
+                    calculated_mix_hash,
+                    header.mix_hash
+                )));
+            }
+        } else {
+            warn!("VSPC list is empty, skipping MixHash verification from VSPC");
+            check_eq(&exp.mix_hash, &header.mix_hash, "mix_hash");
+        }
+    } else {
+        info!("No VSPC list provided, using expected mix_hash for verification");
+        check_eq(&exp.mix_hash, &header.mix_hash, "mix_hash");
+    }
+    
     check_eq(&exp.nonce, &header.nonce, "nonce");
     check_eq(
         &exp.base_fee_per_gas,
