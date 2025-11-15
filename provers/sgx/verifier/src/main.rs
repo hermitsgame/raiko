@@ -14,6 +14,7 @@ use raiko_lib::{
     proof_type::ProofType,
     protocol_instance::ProtocolInstance,
 };
+use reth_primitives::Header;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
 
@@ -378,15 +379,21 @@ fn verify_instance_hash(
 ) -> Result<()> {
     // Calculate block header from guest input
     let header = calculate_block_header(guest_input);
-    
+
+    // Verify header including VSPC list (for devnet with Kaspa L1)
+    // This ensures MixHash is correctly calculated from VSPC data
+    if let Err(e) = verify_header_with_vspc(&guest_input.block.header, &header, guest_input.vspc_list.as_deref()) {
+        return Err(anyhow!("Header verification failed: {}", e));
+    }
+
     // Build ProtocolInstance
     let pi = ProtocolInstance::new(guest_input, &header, ProofType::Sgx)
         .map_err(|e| anyhow!("Failed to create ProtocolInstance: {}", e))?
         .sgx_instance(*instance_address);
-    
+
     // Calculate instance hash
     let calculated_hash = pi.instance_hash();
-    
+
     if calculated_hash != *expected_hash {
         return Err(anyhow!(
             "Instance hash mismatch: calculated {} but proof has {}",
@@ -395,6 +402,69 @@ fn verify_instance_hash(
         ));
     }
     
+    Ok(())
+}
+
+/// Verify header including VSPC list validation (for devnet with Kaspa L1)
+fn verify_header_with_vspc(
+    expected_header: &Header,
+    calculated_header: &Header,
+    vspc_list: Option<&[raiko_lib::input::Vspc]>,
+) -> Result<()> {
+    use raiko_core::cassandra;
+    // Use eprintln! instead of tracing for verifier (no tracing dependency)
+
+    // Basic header field checks
+    if expected_header.parent_hash != calculated_header.parent_hash {
+        return Err(anyhow!("parent_hash mismatch"));
+    }
+    if expected_header.state_root != calculated_header.state_root {
+        return Err(anyhow!("state_root mismatch"));
+    }
+    if expected_header.number != calculated_header.number {
+        return Err(anyhow!("number mismatch"));
+    }
+
+    // For devnet with Kaspa L1, verify MixHash from VSPC list if provided
+    if let Some(vspc_list) = vspc_list {
+        if !vspc_list.is_empty() {
+            eprintln!("Verifying MixHash from {} VSPC entries in verifier...", vspc_list.len());
+            let calculated_mix_hash = cassandra::calculate_mix_hash_from_vspc(vspc_list)
+                .map_err(|e| anyhow!("Failed to calculate MixHash from VSPC: {}", e))?;
+            eprintln!("Calculated MixHash from VSPC: {}, Block MixHash: {}", calculated_mix_hash, calculated_header.mix_hash);
+
+            if calculated_mix_hash == calculated_header.mix_hash {
+                eprintln!("MixHash verified from VSPC list in verifier: {}", calculated_mix_hash);
+            } else {
+                eprintln!("ERROR: MixHash mismatch in verifier! Calculated from VSPC: {}, Block MixHash: {}", calculated_mix_hash, calculated_header.mix_hash);
+                return Err(anyhow!(
+                    "MixHash verification failed: calculated from VSPC: {}, block mix_hash: {}",
+                    calculated_mix_hash,
+                    calculated_header.mix_hash
+                ));
+            }
+
+            // Also verify against expected header
+            if calculated_mix_hash != expected_header.mix_hash {
+                return Err(anyhow!(
+                    "MixHash mismatch with expected header: calculated from VSPC: {}, expected: {}",
+                    calculated_mix_hash,
+                    expected_header.mix_hash
+                ));
+            }
+        } else {
+            eprintln!("WARNING: VSPC list is empty in verifier, skipping MixHash verification from VSPC");
+            if expected_header.mix_hash != calculated_header.mix_hash {
+                return Err(anyhow!("mix_hash mismatch (no VSPC list)"));
+            }
+        }
+    } else {
+        eprintln!("No VSPC list provided in verifier, using expected mix_hash for verification");
+        if expected_header.mix_hash != calculated_header.mix_hash {
+            return Err(anyhow!("mix_hash mismatch"));
+        }
+    }
+
     Ok(())
 }
 
@@ -613,15 +683,22 @@ fn verify_batch_instance_hash(
 ) -> Result<()> {
     // Calculate final blocks from batch input
     let blocks = calculate_batch_blocks_final_header(batch_guest_input);
-    
+
+    // Verify headers including VSPC list for each block (for devnet with Kaspa L1)
+    for (input, block) in batch_guest_input.inputs.iter().zip(blocks.iter()) {
+        if let Err(e) = verify_header_with_vspc(&input.block.header, &block.header, input.vspc_list.as_deref()) {
+            return Err(anyhow!("Batch block {} header verification failed: {}", block.header.number, e));
+        }
+    }
+
     // Build ProtocolInstance for batch
     let pi = ProtocolInstance::new_batch(batch_guest_input, blocks, ProofType::Sgx)
         .map_err(|e| anyhow!("Failed to create ProtocolInstance for batch: {}", e))?
         .sgx_instance(*instance_address);
-    
+
     // Calculate instance hash
     let calculated_hash = pi.instance_hash();
-    
+
     if calculated_hash != *expected_hash {
         return Err(anyhow!(
             "Batch instance hash mismatch: calculated {} but proof has {}",
@@ -629,7 +706,7 @@ fn verify_batch_instance_hash(
             expected_hash
         ));
     }
-    
+
     Ok(())
 }
 

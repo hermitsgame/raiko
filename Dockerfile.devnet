@@ -18,7 +18,9 @@ RUN git clone --depth 1 --branch 2.16.2 https://github.com/datastax/cpp-driver.g
     cmake .. && \
     make && \
     make install && \
-    cd / && rm -rf /tmp/cpp-driver
+    cd / && rm -rf /tmp/cpp-driver && \
+    # Update library cache after installation
+    ldconfig
 WORKDIR /opt/raiko
 ENV DEBIAN_FRONTEND=noninteractive
 ARG BUILD_FLAGS=""
@@ -29,6 +31,8 @@ COPY docker/cargo-config.toml .cargo/config.toml
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+# Ensure library paths are available for linking
+RUN ldconfig
 COPY --from=planner /opt/raiko/recipe.json recipe.json
 RUN cargo chef cook --release ${BUILD_FLAGS} --features "sgx" --features "docker_build" --recipe-path recipe.json
 COPY . .
@@ -70,14 +74,33 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Cassandra C++ driver libraries from builder stage
-COPY --from=builder /usr/local/lib/libcassandra.so* /usr/local/lib/
-
 RUN mkdir -p \
     ./bin \
     ./provers/sgx \
-    /var/log/raiko && \
-    ldconfig
+    /var/log/raiko \
+    /usr/local/lib/x86_64-linux-gnu
+
+# Copy Cassandra C++ driver libraries from builder stage
+# cpp-driver installs libraries to /usr/local/lib/x86_64-linux-gnu/
+RUN --mount=from=builder,source=/,target=/mnt/builder,ro \
+    sh -c ' \
+    if [ -d /mnt/builder/usr/local/lib/x86_64-linux-gnu ] && ls /mnt/builder/usr/local/lib/x86_64-linux-gnu/libcassandra.so* >/dev/null 2>&1; then \
+        cp /mnt/builder/usr/local/lib/x86_64-linux-gnu/libcassandra.so* /usr/local/lib/x86_64-linux-gnu/; \
+        echo "Copied libcassandra from /usr/local/lib/x86_64-linux-gnu"; \
+    elif [ -d /mnt/builder/usr/local/lib ] && ls /mnt/builder/usr/local/lib/libcassandra.so* >/dev/null 2>&1; then \
+        cp /mnt/builder/usr/local/lib/libcassandra.so* /usr/local/lib/x86_64-linux-gnu/; \
+        echo "Copied libcassandra from /usr/local/lib"; \
+    elif [ -d /mnt/builder/usr/lib/x86_64-linux-gnu ] && ls /mnt/builder/usr/lib/x86_64-linux-gnu/libcassandra.so* >/dev/null 2>&1; then \
+        cp /mnt/builder/usr/lib/x86_64-linux-gnu/libcassandra.so* /usr/local/lib/x86_64-linux-gnu/; \
+        echo "Copied libcassandra from /usr/lib/x86_64-linux-gnu"; \
+    else \
+        echo "Warning: libcassandra.so not found in builder stage"; \
+        find /mnt/builder -name "libcassandra.so*" 2>/dev/null | head -5; \
+    fi'
+
+# Update library cache and verify
+RUN ldconfig && \
+    ls -la /usr/local/lib/x86_64-linux-gnu/libcassandra.so* 2>/dev/null || echo "libcassandra.so not found after copy"
 
 COPY --from=builder /opt/raiko/docker/entrypoint.sh ./bin/
 COPY --from=builder /opt/raiko/provers/sgx/config/sgx-guest.docker.manifest.template ./provers/sgx/config/sgx-guest.local.manifest.template
